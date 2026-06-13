@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>AI中英口译平台 - 原生语音优化（修复输入+减少重复+补充标点）</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; font-family: "Microsoft Yahei", sans-serif; }
+        body { background-color: #e6f4ff; padding: 40px 20px; }
+        .container { max-width: 1000px; margin: 0 auto; }
+        h1 { text-align: center; color: #1890ff; margin-bottom: 30px; font-size: 36px; }
+        .mode-selector { display: flex; justify-content: center; gap: 20px; margin-bottom: 30px; }
+        .mode-btn { padding: 15px 40px; font-size: 18px; border: 3px solid #91caff; border-radius: 12px; background: white; cursor: pointer; transition: all 0.3s; color: #666; }
+        .mode-btn.active { background: #1890ff; color: white; border-color: #1890ff; }
+        .box-wrap { display: flex; gap: 30px; margin-bottom: 30px; }
+        textarea { flex: 1; height: 280px; padding: 15px; font-size: 16px; line-height: 1.8; border: 2px solid #91caff; border-radius: 12px; background: #ffffff; resize: none; transition: border-color 0.3s; }
+        textarea:focus { outline: none; border-color: #1890ff; }
+        #outputText { background: #f6ffed; }
+        .btn-wrap { display: flex; gap: 20px; justify-content: center; flex-wrap: wrap; }
+        button { width: 180px; height: 60px; font-size: 18px; border: none; border-radius: 15px; background-color: #40a9ff; color: #fff; cursor: pointer; transition: 0.2s; display: flex; align-items: center; justify-content: center; gap: 8px; }
+        button:hover:not(:disabled) { background-color: #1890ff; transform: translateY(-2px); }
+        button:disabled { background-color: #d9d9d9; color: #999; cursor: not-allowed; }
+        button.listening { background-color: #ff7875; animation: pulse 1.5s infinite; }
+        button.speaking { background-color: #52c41a; animation: pulse 1.5s infinite; }
+        @keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.05); } }
+        .status-bar { text-align: center; margin-top: 20px; padding: 15px; background: white; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .status-indicator { display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin-right: 8px; background: #ccc; }
+        .status-indicator.active { background: #52c41a; animation: blink 1s infinite; }
+        @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .toast { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.8); color: #fff; padding: 12px 24px; border-radius: 8px; font-size: 16px; z-index: 1000; opacity: 0; transition: opacity 0.3s; }
+        .toast.show { opacity: 1; }
+        @media (max-width: 768px) { .box-wrap { flex-direction: column; } }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>&#127760; AI中英口译平台</h1>
+        <div class="mode-selector">
+            <button class="mode-btn active" id="zhMode" onclick="setTranslationMode('zh')">&#127464;&#127475; 中文 → 英文</button>
+            <button class="mode-btn" id="enMode" onclick="setTranslationMode('en')">&#127482;&#127480; English → 中文</button>
+        </div>
+        <div class="box-wrap">
+            <textarea id="inputText" placeholder="&#9989; 请将需要翻译的内容输入到此处~"></textarea>
+            <textarea id="outputText" placeholder="&#10024; 翻译结果"></textarea>
+        </div>
+        <div class="btn-wrap">
+            <button id="btnSpeak" onclick="toggleVoiceInput()">&#127908; 开始说话</button>
+            <button id="btnRead" onclick="toggleReadResult()">&#128266; 朗读结果</button>
+        </div>
+        <div class="status-bar">
+            <span class="status-indicator" id="statusIndicator"></span>
+            <span id="statusText">准备就绪 - 手动输入或开启语音识别</span>
+        </div>
+    </div>
+    <div id="toast" class="toast"></div>
+
+    <script>
+    // ==================== 全局状态管理（修复版核心） ====================
+    const state = {
+        translationMode: 'zh',
+        isListening: false,
+        isSpeaking: false,
+        recognition: null,
+        synthesisUtterance: null,
+        translateDebounceTimer: null,
+        // 【修复1】用fullInputText统一存储完整的识别文本，避免覆盖
+        fullInputText: '',
+        lastFullTranslated: ''
+    };
+
+    // ==================== DOM 元素缓存 ====================
+    const elements = {
+        inputText: document.getElementById('inputText'),
+        outputText: document.getElementById('outputText'),
+        btnSpeak: document.getElementById('btnSpeak'),
+        btnRead: document.getElementById('btnRead'),
+        statusIndicator: document.getElementById('statusIndicator'),
+        statusText: document.getElementById('statusText'),
+        toast: document.getElementById('toast')
+    };
+
+    // ==================== 工具函数 ====================
+    function showToast(message, duration = 2000) {
+        elements.toast.textContent = message;
+        elements.toast.classList.add('show');
+        setTimeout(() => elements.toast.classList.remove('show'), duration);
+    }
+
+    function updateStatus(text, active = false) {
+        elements.statusText.textContent = text;
+        elements.statusIndicator.classList.toggle('active', active);
+    }
+
+    // ==================== 翻译函数 ====================
+    async function translateFullText(fullText) {
+        if (!fullText.trim()) return '';
+        const fromLang = state.translationMode === 'zh' ? 'zh' : 'en';
+        const toLang = state.translationMode === 'zh' ? 'en' : 'zh';
+        try {
+            const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(fullText)}&langpair=${fromLang}|${toLang}`;
+            const response = await fetch(url);
+            const data = await response.json();
+            return data.responseStatus === 200 ? data.responseData.translatedText : '';
+        } catch (error) {
+            return `[翻译出错：${error.message}]`;
+        }
+    }
+
+    // ==================== 核心渲染函数（修复2：确保输入框同步） ====================
+    function updateFullText(newText) {
+        // 统一更新全局状态，再同步到输入框（关键！避免状态和输入框不一致）
+        state.fullInputText = newText;
+        elements.inputText.value = newText;
+        
+        // 防抖触发翻译，确保翻译的是完整的最新文本
+        clearTimeout(state.translateDebounceTimer);
+        state.translateDebounceTimer = setTimeout(async () => {
+            const translatedResult = await translateFullText(state.fullInputText);
+            if (translatedResult !== state.lastFullTranslated) {
+                elements.outputText.value = translatedResult;
+                state.lastFullTranslated = translatedResult;
+            }
+        }, 300);
+    }
+
+    // ==================== 翻译模式设置 ====================
+    function setTranslationMode(mode) {
+        state.translationMode = mode;
+        document.querySelectorAll('.mode-btn').forEach(btn => btn.classList.remove('active'));
+        document.getElementById(mode + 'Mode').classList.add('active');
+        
+        const modeNames = { 'zh': '中文 → 英文', 'en': '英文 → 中文' };
+        showToast(`已切换为 ${modeNames[mode]} 模式`);
+        updateStatus(`当前模式: ${modeNames[mode]} - 语音识别直接进输入框`);
+        
+        if (state.recognition) {
+            state.recognition.lang = mode === 'zh' ? 'zh-CN' : 'en-US';
+        }
+        
+        // 重置状态
+        state.fullInputText = '';
+        state.lastFullTranslated = '';
+        elements.inputText.value = '';
+        elements.outputText.value = '';
+    }
+
+    // ==================== 核心：自动补充标点（修复后保留原有特性） ====================
+    function addPunctuation(text) {
+        if (!text.trim()) return text;
+        // 去除末尾已有的标点
+        const trimmed = text.trim().replace(/[。！？.!?]+$/, '');
+        // 根据语气词判断标点（简单规则，可根据需求扩展）
+        if (trimmed.includes('吗') || trimmed.includes('呢') || trimmed.endsWith('吗') || trimmed.endsWith('呢')) {
+            return trimmed + '？';
+        } else if (trimmed.includes('！') || trimmed.endsWith('啊') || trimmed.endsWith('呀')) {
+            return trimmed + '！';
+        } else {
+            return trimmed + '。'; // 默认添加句号
+        }
+    }
+
+    // ==================== 核心：原生语音识别初始化（修复3：补全结果处理，确保文本进入输入框） ====================
+    function initRecognition() {
+        if (!window.SpeechRecognition && !window.webkitSpeechRecognition) {
+            showToast('浏览器不支持语音识别，请使用Chrome/Edge/Edge浏览器');
+            return null;
+        }
+
+        const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        const rec = new Recognition();
+        
+        // 配置：连续识别，但只获取最终结果（减少重复）
+        rec.continuous = true;
+        rec.interimResults = false;
+        rec.lang = state.translationMode === 'zh' ? 'zh-CN' : 'en-US';
+        rec.maxAlternatives = 1;
+
+        // 【修复核心】处理识别结果：确保文本进入输入框
+        rec.onresult = async (event) => {
+            // 遍历所有识别结果（支持连续多句识别）
+            for (let i = event.resultIndex; i < event.results.length; i++) {
+                const result = event.results[i];
+                if (result.isFinal) {
+                    const transcript = result[0].transcript;
+                    // 补充标点
+                    const textWithPunctuation = addPunctuation(transcript);
+                    // 【关键修复】追加到全局完整文本（不是覆盖！），再同步到输入框
+                    // 如果当前为空，直接赋值；否则追加（保留之前的所有识别内容）
+                    if (!state.fullInputText.trim()) {
+                        state.fullInputText = textWithPunctuation + ' ';
+                    } else {
+                        // 避免重复添加（比如连续识别同一句话），但允许追加新内容
+                        if (!state.fullInputText.includes(textWithPunctuation)) {
+                            state.fullInputText += textWithPunctuation + ' ';
+                        }
+                    }
+                    // 统一通过updateFullText同步到输入框，触发翻译
+                    updateFullText(state.fullInputText);
+                }
+            }
+        };
+
+        rec.onstart = () => {
+            state.isListening = true;
+            elements.btnSpeak.innerHTML = '&#128308; 停止聆听';
+            elements.btnSpeak.classList.add('listening');
+            updateStatus('正在录音（识别文本中，自动同步到输入框）', true);
+            showToast('已启动录音，识别内容实时输入到输入框');
+        };
+
+        rec.onend = () => {
+            state.isListening = false;
+            elements.btnSpeak.innerHTML = '&#127908; 开始说话';
+            elements.btnSpeak.classList.remove('listening');
+            // 用户还想继续说，自动重启识别（核心！避免中断）
+            if (state.isListening) {
+                try {
+                    rec.start();
+                } catch (e) {
+                    console.warn('自动重启识别失败，请手动点击', e);
+                }
+            } else {
+                updateStatus('录音已停，识别内容已输入到输入框');
+            }
+        };
+
+        rec.onerror = (event) => {
+            console.error('识别错误:', event.error);
+            state.isListening = false;
+            elements.btnSpeak.innerHTML = '&#127908; 开始说话';
+            elements.btnSpeak.classList.remove('listening');
+            if (event.error === 'no-speech') {
+                showToast('未检测到语音，请说话后重试');
+            } else if (event.error === 'not-allowed') {
+                showToast('麦克风权限被拒绝，请前往浏览器设置开启');
+            } else {
+                showToast('识别出错: ' + (event.error || '未知错误'));
+            }
+            // 识别出错后重置状态，避免无法再次启动
+            if (state.recognition) {
+                state.recognition = null;
+            }
+        };
+
+        return rec;
+    }
+
+    // ==================== 语音输入控制（修复：优化状态管理） ====================
+    async function toggleVoiceInput() {
+        if (state.isSpeaking) {
+            speechSynthesis.cancel();
+            toggleReadResult();
+        }
+
+        // 初始化识别实例（如果未初始化）
+        if (!state.recognition) {
+            state.recognition = initRecognition();
+            if (!state.recognition) return;
+        }
+
+        if (state.isListening) {
+            // 停止录音
+            state.isListening = false;
+            try {
+                state.recognition.stop();
+            } catch (e) {
+                console.warn('停止识别时出错', e);
+            }
+            elements.btnSpeak.innerHTML = '&#127908; 开始说话';
+            elements.btnSpeak.classList.remove('listening');
+            updateStatus('录音已停止，识别内容已输入到输入框');
+            showToast('已停止录音');
+        } else {
+            // 启动录音
+            state.recognition.lang = state.translationMode === 'zh' ? 'zh-CN' : 'en-US';
+            try {
+                state.recognition.start();
+            } catch (e) {
+                console.warn('启动识别时出错，尝试重新初始化', e);
+                // 重启失败，重新初始化
+                state.recognition = initRecognition();
+                if (state.recognition) {
+                    state.recognition.start();
+                }
+            }
+        }
+    }
+
+    // ==================== 语音朗读控制 ====================
+    function toggleReadResult() {
+        if (state.isSpeaking) {
+            speechSynthesis.cancel();
+            state.isSpeaking = false;
+            elements.btnRead.innerHTML = '&#128266; 朗读结果';
+            elements.btnRead.classList.remove('speaking');
+            updateStatus('朗读已停止');
+            showToast('已停止朗读');
+        } else {
+            const translateResult = elements.outputText.value.trim();
+            if (!translateResult) {
+                showToast('翻译结果为空，请先通过语音或手动输入内容');
+                return;
+            }
+
+            if (state.isListening) {
+                toggleVoiceInput();
+            }
+
+            state.isSpeaking = true;
+            elements.btnRead.innerHTML = '&#9209;️ 停止朗读';
+            elements.btnRead.classList.add('speaking');
+            updateStatus('正在朗读翻译结果...', true);
+            showToast('开始朗读');
+
+            const utterance = new SpeechSynthesisUtterance(translateResult);
+            utterance.lang = state.translationMode === 'zh' ? 'en-US' : 'zh-CN';
+            utterance.rate = 0.9;
+            utterance.pitch = 1;
+            utterance.volume = 1;
+
+            utterance.onend = () => {
+                state.isSpeaking = false;
+                elements.btnRead.innerHTML = '&#128266; 朗读结果';
+                elements.btnRead.classList.remove('speaking');
+                updateStatus('朗读完成');
+                showToast('朗读完成');
+            };
+
+            utterance.onerror = (event) => {
+                state.isSpeaking = false;
+                elements.btnRead.innerHTML = '&#128266; 朗读结果';
+                elements.btnRead.classList.remove('speaking');
+                updateStatus('朗读出错');
+                showToast('朗读出错：' + (event.error || '未知错误'));
+            };
+
+            speechSynthesis.speak(utterance);
+            state.synthesisUtterance = utterance;
+        }
+    }
+
+    // ==================== 手动输入支持 ====================
+    elements.inputText.addEventListener('input', (e) => {
+        state.fullInputText = e.target.value;
+        updateFullText(state.fullInputText);
+    });
+
+    // ==================== 快捷键支持 ====================
+    document.addEventListener('keydown', (e) => {
+        if (e.altKey && e.key === 's') { e.preventDefault(); toggleVoiceInput(); }
+        if (e.altKey && e.key === 'r') { e.preventDefault(); toggleReadResult(); }
+        if (e.key === 'F1') { e.preventDefault(); setTranslationMode('zh'); }
+        if (e.key === 'F2') { e.preventDefault(); setTranslationMode('en'); }
+    });
+
+    // ==================== 初始化 ====================
+    showToast('欢迎使用AI中英口译平台！', 3500);
+    </script>
+</body>
+</html>
